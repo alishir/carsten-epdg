@@ -132,16 +132,27 @@ init([]) ->
     logger:info("XFRM: offload_mode=~p iface=~s", [Mode, Iface]),
     {ok, #state{offload_mode = Mode, iface = Iface}}.
 
-handle_call({create_sa, Params}, _From, State) ->
-    {reply, do_create_sa(Params, State), State};
-handle_call({delete_sa, Params}, _From, State) ->
-    {reply, do_delete_sa(Params), State};
-handle_call({flush_sa_endpoint, Params}, _From, State) ->
-    {reply, do_flush_sa_endpoint(Params), State};
-handle_call({create_policy, Params}, _From, State) ->
-    {reply, do_create_policy(Params), State};
-handle_call({delete_policy, Params}, _From, State) ->
-    {reply, do_delete_policy(Params), State};
+%% Each of these runs an `ip xfrm` command. They are executed in a process of
+%% their own and answered with gen_server:reply/2: inside this server the
+%% five commands of every attach (and of every detach) of all UEs ran one
+%% after the other, which capped the ePDG at a few dozen attaches per second.
+%% A UE's FSM still issues its own commands in order, since it waits for each
+%% reply.
+handle_call({create_sa, Params}, From, State) ->
+    async_reply(From, fun() -> do_create_sa(Params, State) end),
+    {noreply, State};
+handle_call({delete_sa, Params}, From, State) ->
+    async_reply(From, fun() -> do_delete_sa(Params) end),
+    {noreply, State};
+handle_call({flush_sa_endpoint, Params}, From, State) ->
+    async_reply(From, fun() -> do_flush_sa_endpoint(Params) end),
+    {noreply, State};
+handle_call({create_policy, Params}, From, State) ->
+    async_reply(From, fun() -> do_create_policy(Params) end),
+    {noreply, State};
+handle_call({delete_policy, Params}, From, State) ->
+    async_reply(From, fun() -> do_delete_policy(Params) end),
+    {noreply, State};
 handle_call(get_offload_mode, _From, #state{offload_mode = M} = State) ->
     {reply, M, State};
 handle_call(flush_all, _From, State) ->
@@ -152,6 +163,17 @@ handle_call(_Req, _From, State) ->
     {reply, {error, unknown}, State}.
 
 handle_cast(_Msg, State) -> {noreply, State}.
+
+async_reply(From, Fun) ->
+    _ = spawn(fun() ->
+                  Result = try Fun()
+                           catch Class:Reason ->
+                               logger:warning("XFRM command failed: ~p:~p", [Class, Reason]),
+                               {error, {Class, Reason}}
+                           end,
+                  gen_server:reply(From, Result)
+              end),
+    ok.
 handle_info(_Info, State) -> {noreply, State}.
 terminate(_Reason, _State) -> ok.
 code_change(_OldVsn, State, _Extra) -> {ok, State}.

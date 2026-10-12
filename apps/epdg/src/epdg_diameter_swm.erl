@@ -186,19 +186,25 @@ init([]) ->
                         transports      = #{}}}
     end.
 
-handle_call({der, Opts}, _From, #state{service_started = true} = State) ->
-    Result = send_der(Opts),
+%% The request is sent from a process of its own and answered with
+%% gen_server:reply/2. diameter:call/4 blocks until the answer is there; done
+%% inside this server it made the ePDG handle one SWm transaction at a time,
+%% for all UEs. At about 20 attaches per second the queue grew past the
+%% callers' timeout and half of the attaches died in IKE_AUTH
+%% ({timeout,{gen_server,call,[epdg_diameter_swm,{der,...}]}}).
+handle_call({der, Opts}, From, #state{service_started = true} = State) ->
     epdg_metrics:inc(diameter_swm_requests_total),
-    {reply, Result, State};
+    async_reply(From, fun() -> send_der(Opts) end),
+    {noreply, State};
 
-handle_call({aar, Opts}, _From, #state{service_started = true} = State) ->
-    Result = send_aar(Opts),
+handle_call({aar, Opts}, From, #state{service_started = true} = State) ->
     epdg_metrics:inc(diameter_swm_requests_total),
-    {reply, Result, State};
+    async_reply(From, fun() -> send_aar(Opts) end),
+    {noreply, State};
 
-handle_call({str, Opts}, _From, #state{service_started = true} = State) ->
-    Result = send_str(Opts),
-    {reply, Result, State};
+handle_call({str, Opts}, From, #state{service_started = true} = State) ->
+    async_reply(From, fun() -> send_str(Opts) end),
+    {noreply, State};
 
 handle_call(_, _From, #state{service_started = false} = State) ->
     {reply, {error, diameter_not_started}, State};
@@ -348,6 +354,17 @@ send_str(#{session_id := SessionId} = Opts) ->
 
 send_str(_Opts) ->
     {error, missing_session_id}.
+
+async_reply(From, Fun) ->
+    _ = spawn(fun() ->
+                  Result = try Fun()
+                           catch Class:Reason ->
+                               logger:warning("SWm request failed: ~p:~p", [Class, Reason]),
+                               {error, {Class, Reason}}
+                           end,
+                  gen_server:reply(From, Result)
+              end),
+    ok.
 
 do_call(Msg, ParseFun) ->
     case diameter:call(?SVC_NAME, ?APP_ALIAS, Msg, [{timeout, ?DIAM_CALL_TIMEOUT}]) of
