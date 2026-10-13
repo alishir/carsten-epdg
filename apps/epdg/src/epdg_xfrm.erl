@@ -22,7 +22,7 @@
 -ifdef(TEST).
 %% The policy pipeline itself, so the EUnit suite (epdg_xfrm_scope_tests) can
 %% measure what it lets through to the BEAM.
--export([policy_list_cmd/1]).
+-export([policy_list_cmd/1, state_reduce_filter/0]).
 -endif.
 
 -define(SERVER, ?MODULE).
@@ -455,8 +455,17 @@ local_route(_Op, _Dir, _Dst, _If) ->
 state_list_cmds(LocalIP) ->
     Local = lists:flatten(ip_str(LocalIP)),
     [lists:flatten(io_lib:format(
-         "ip xfrm state list ~s ~s proto esp 2>/dev/null", [Key, Local]))
+         "ip xfrm state list ~s ~s proto esp 2>/dev/null | ~s",
+         [Key, Local, state_reduce_filter()]))
      || Key <- ["src", "dst"]].
+
+%% Of each SA only the "src A dst B" line and the "proto esp spi ..." line
+%% reach the BEAM; parse_state_block/1 reads nothing else. os:cmd/1 returns a
+%% list of characters (16 bytes each), so the full dump of 30,000 SAs (20 MB
+%% of text, keys included) took several hundred MB every sweep and the ePDG
+%% was OOM-killed at about 15,000 UEs.
+state_reduce_filter() ->
+    "awk '/^src / || $1 == \"proto\"'".
 
 %% Keep a policy block only if a "tmpl src A dst B" line names LocalIP.
 %% A block starts at every unindented line (see split_blocks/1).

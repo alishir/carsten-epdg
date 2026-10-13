@@ -167,7 +167,7 @@ init([]) ->
                 {transport_module, TransMod},
                 {transport_config, [{reuseaddr, true},
                                     {ip, {0,0,0,0}},
-                                    {port, DiamPort}]}
+                                    {port, DiamPort}] ++ socket_opts(TransMod)}
             ]}),
 
             InitTransports = maps:from_list(
@@ -698,7 +698,7 @@ try_connect_host(Host, #state{dra_port = DRAPort, transport_mod = TransMod,
                 {transport_module, TransMod},
                 {transport_config, [{raddr, DRAIP},
                                     {rport, DRAPort},
-                                    {ip, connect_local_ip(TransMod)}]},
+                                    {ip, connect_local_ip(TransMod)}] ++ socket_opts(TransMod)},
                 {reconnect_timer, 5000},
                 {capabilities,
                     [{'Auth-Application-Id', [?SWM_APP_ID]}]}
@@ -763,6 +763,14 @@ match_peer_ref(Info, PeerRef) ->
 
 retry_delay(Retries) ->
     min(?DNS_RETRY_INITIAL bsl min(Retries, 4), ?DNS_RETRY_MAX).
+
+%% gen_sctp opens its sockets with a 1024 byte receive buffer. The ePDG
+%% then advertised a receive window of about 1.3 kB to the DRA, so the DRA
+%% could deliver SWm answers only one packet per SACK and its send queue
+%% towards the ePDG filled up under load. Nagle is off per RFC 3539
+%% section 3.2. The kernel caps recbuf at net.core.rmem_max.
+socket_opts(diameter_sctp) -> [{sctp_nodelay, true}, {recbuf, 262144}];
+socket_opts(_)             -> [].
 
 transport_module("sctp") -> diameter_sctp;
 transport_module("tcp")  -> diameter_tcp;

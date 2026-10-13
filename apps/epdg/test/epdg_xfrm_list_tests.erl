@@ -38,6 +38,20 @@ parses_both_sas_test() ->
     ?assertEqual(#{src => {34,107,29,11}, dst => {93,204,201,107},
                    spi => 16#c91f55b2, reqid => 93800770}, Out).
 
+%% The sweep runs every 30 s over every SA of the ePDG. What it hands to the
+%% BEAM must stay small per SA and must still yield exactly the same SAs:
+%% the reconciler deletes what it does not find claimed.
+reduced_dump_yields_the_same_sas_test() ->
+    File = filename:join(os:getenv("TMPDIR", "/tmp"),
+                         "epdg_xfrm_state_" ++ os:getpid()),
+    ok = file:write_file(File, state_output()),
+    Reduced = os:cmd("cat " ++ File ++ " | " ++ epdg_xfrm:state_reduce_filter()),
+    ok = file:delete(File),
+    ?assertEqual(epdg_xfrm:parse_state_list(state_output()),
+                 epdg_xfrm:parse_state_list(Reduced)),
+    ?assertEqual(4, length(string:lexemes(Reduced, "\n"))),
+    ?assertEqual(nomatch, string:find(Reduced, "0x0011223344556677")).
+
 empty_state_output_test() ->
     ?assertEqual([], epdg_xfrm:parse_state_list("")),
     ?assertEqual([], epdg_xfrm:parse_state_list("\n")).
