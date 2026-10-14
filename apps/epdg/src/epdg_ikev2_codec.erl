@@ -673,7 +673,7 @@ decode_auth_payload(_) ->
 %%
 %% 3GPP TS 24.302 additions used for VoWiFi:
 %%   20 P_CSCF_IP4_ADDRESS
-%%   22 P_CSCF_IP6_ADDRESS
+%%   21 P_CSCF_IP6_ADDRESS
 %%====================================================================
 
 -define(CP_CFG_REQUEST, 1).

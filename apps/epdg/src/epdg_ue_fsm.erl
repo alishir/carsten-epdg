@@ -30,7 +30,9 @@
          ue6_selector/1, ip6_mask/2, build_cfg_reply/1,
          requested_handover_addrs/1,
          %% Session persistence: snapshot <-> #data roundtrip
-         session_snapshot/1, data_from_snapshot/1]).
+         session_snapshot/1, data_from_snapshot/1,
+         %% S2b teardown: whether and with what to send the Delete Session
+         pgw_delete_params/1, s2b_delete_action/2]).
 -endif.
 
 %% ?UE6_PREFIX_LEN: CFG_REPLY prefix length, XFRM inner selectors, handover
@@ -268,7 +270,7 @@ init(#{peer_ip := PeerIP, peer_port := PeerPort} = _Ctx) ->
         ike_auth_last_msg_id = undefined
     }}.
 
-terminate(_Reason, _State, #data{responder_spi = RSPI, imsi = IMSI,
+terminate(Reason, _State, #data{responder_spi = RSPI, imsi = IMSI,
                                   peer_ip = PeerIP, initiator_spi = ISPI,
                                   child_sa = ChildSA, pgw_session = PGW,
                                   ue_nai = UeNai, ue_inner_ip = UeInnerIp,
@@ -290,13 +292,16 @@ terminate(_Reason, _State, #data{responder_spi = RSPI, imsi = IMSI,
             catch epdg_ue_registry:unregister_esp_spis(SpiIn, SpiOut);
         _ -> ok
     end,
-    case PGW of
-        #{pgw_c_teid := CTEID, ebi := EBI} ->
-            catch epdg_gtpc_client:delete_session_request(
-                    #{pgw_c_teid => CTEID, ebi => EBI});
-        #{pgw_teid := TEID} ->
-            catch epdg_gtpc_client:delete_session_request(#{pgw_teid => TEID});
-        _ -> ok
+    %% Release the PDN connection at the PGW (S2b Delete Session Request,
+    %% TS 29.274 clause 7.2.9.1). Not when a newer session of the same IMSI
+    %% superseded this one: the PGW replaced the PDN connection when it
+    %% accepted the new Create Session Request, and a Delete with the old
+    %% TEID could hit a reused one. Best effort, spawned like the SWm STR
+    %% below (KI-4: the previous match keys never existed, so no Delete
+    %% was ever sent).
+    case s2b_delete_action(Reason, PGW) of
+        {send, DeleteParams} -> maybe_send_s2b_delete(DeleteParams, IMSI);
+        skip                 -> ok
     end,
     %% Release the SWm Diameter session toward the 3GPP AAA Server
     %% (TS 29.273 clause 7 session-termination procedure). Fire-and-forget
@@ -361,6 +366,56 @@ maybe_send_swm_str(SessionId, DestHost, IMSI, UeNai) ->
             Other ->
                 logger:info("SWm STR best-effort send result session_id=~s "
                             "IMSI=~p: ~p", [SessionId, IMSI, Other])
+        end
+    end),
+    ok.
+
+%% The PGW's S2b control TEID and the linked EBI, as the Delete Session
+%% Request needs them, taken from the decoded Create Session Response kept
+%% in #data.pgw_session (keys `pgw_c_fteid' and `ebi', see
+%% epdg_gtpc_codec:decode_create_session_response/1). `none' when the PGW
+%% never created a session for this UE. The EBI the PGW echoes may be
+%% absent (`undefined'); the ePDG always asks for the default bearer EBI 5.
+-spec pgw_delete_params(map() | undefined) ->
+          {ok, #{pgw_c_teid := pos_integer(), ebi := 5..15}} | none.
+pgw_delete_params(PGW) when is_map(PGW) ->
+    case pgw_c_teid(PGW) of
+        0    -> none;
+        TEID -> {ok, #{pgw_c_teid => TEID, ebi => linked_ebi(PGW)}}
+    end;
+pgw_delete_params(_) ->
+    none.
+
+linked_ebi(#{ebi := E}) when is_integer(E), E >= 5, E =< 15 -> E;
+linked_ebi(_) -> 5.
+
+%% Whether terminate/3 releases the PDN connection at the PGW. Pure, so
+%% the rule is testable without a live FSM.
+-spec s2b_delete_action(term(), map() | undefined) -> {send, map()} | skip.
+s2b_delete_action({shutdown, superseded}, _PGW) ->
+    skip;
+s2b_delete_action(_Reason, PGW) ->
+    case pgw_delete_params(PGW) of
+        {ok, Params} -> {send, Params};
+        none         -> skip
+    end.
+
+%% Best-effort S2b Delete Session Request. Spawned: the GTP-C call blocks
+%% for up to the request timeout, longer than the FSM's 5 s shutdown budget.
+maybe_send_s2b_delete(Params, IMSI) ->
+    spawn(fun() ->
+        case catch epdg_gtpc_client:delete_session_request(Params) of
+            {ok, #{ies := IEs}} ->
+                Cause = case lists:keyfind(cause, 1, IEs) of
+                    {cause, <<C:8, _/binary>>} -> C;
+                    _                          -> undefined
+                end,
+                logger:info("S2b Delete Session Response IMSI=~p pgw_c_teid=~p "
+                            "cause=~p", [IMSI, maps:get(pgw_c_teid, Params), Cause]);
+            Other ->
+                logger:notice("S2b Delete Session Request IMSI=~p pgw_c_teid=~p "
+                              "not confirmed: ~p",
+                              [IMSI, maps:get(pgw_c_teid, Params), Other])
         end
     end),
     ok.
@@ -470,6 +525,12 @@ ike_auth(cast, disconnect, Data) ->
     _ = try_send_delete_informational(Data),
     {stop, {shutdown, aaa_abort}};
 
+%% A newer session of the same IMSI took over (supersede_existing_session/2).
+%% Distinct stop reason: terminate/3 must not send an S2b Delete for it.
+ike_auth(cast, supersede, Data) ->
+    _ = try_send_delete_informational(Data),
+    {stop, {shutdown, superseded}};
+
 %% The GTP-C client saw the PGW restart (Recovery IE change) or lost
 %% its Echo heartbeat — every ongoing session is invalid, so tear down
 %% cleanly and the UE will redial.
@@ -561,6 +622,10 @@ established(cast, {ikev2, #{exchange_type := ike_auth, message_id := MsgId} = _H
 established(cast, disconnect, Data) ->
     _ = try_send_delete_informational(Data),
     {stop, {shutdown, aaa_abort}};
+
+established(cast, supersede, Data) ->
+    _ = try_send_delete_informational(Data),
+    {stop, {shutdown, superseded}};
 
 established(cast, pgw_restart, _Data) -> {stop, {shutdown, pgw_restart}};
 established(cast, pgw_down,    _Data) -> {stop, {shutdown, pgw_unreachable}};
@@ -1724,7 +1789,7 @@ proceed_with_s2b(MsgId, InFlags, ISPI, RSPI,
     logger:info("S2b Create-Session IMSI=~p APN=~p pdn_type=~B (1=v4 2=v6 3=v4v6)"
                 " handover_v4=~p handover_v6=~p",
                 [IMSI, Apn, PdnType, HoV4, HoV6]),
-    case epdg_gtpc_client:create_session_request(#{
+    CsrParams = #{
             imsi         => IMSI,
             apn          => Apn,
             rat_type     => 3,           %% WLAN
@@ -1734,7 +1799,13 @@ proceed_with_s2b(MsgId, InFlags, ISPI, RSPI,
             ebi          => 5,
             local_c_teid => LocalCTeid,
             local_u_teid => LocalUTeid
-        }) of
+        },
+    %% The client answers within its own retransmission budget; should the
+    %% call still time out, fail this attach rather than crash the FSM.
+    CsrResult = try epdg_gtpc_client:create_session_request(CsrParams)
+                catch exit:{timeout, _} -> {error, call_timeout}
+                end,
+    case CsrResult of
         %% TS 29.274 §8.4 Table 8.4-1: cause values 16..63 are the
         %% "Acceptance" range, 64..239 are "Rejection". For a dual-stack
         %% (pdn_type=3) request the PGW commonly answers with cause 18
@@ -3107,7 +3178,7 @@ supersede_existing_session(IMSI, RSPI) ->
             logger:notice("Superseding stale session for IMSI=~p "
                           "(new RSPI=~.16B, old pid=~p)", [IMSI, RSPI, OldPid]),
             epdg_metrics:inc(session_superseded_total),
-            gen_statem:cast(OldPid, disconnect);
+            gen_statem:cast(OldPid, supersede);
         _ ->
             ok
     end.

@@ -23,7 +23,7 @@
 
 -behaviour(gen_server).
 
--export([start_link/0,
+-export([start_link/0, call_timeout/0,
          create_session_request/1, delete_session_request/1,
          send_bearer_response/1,
          peer_status/0]).
@@ -39,7 +39,15 @@
 -define(DEFAULT_BACKOFF_MAX_MS,  30000).
 -define(DEFAULT_MAX_DOWN_SEC,       30).
 -define(DEFAULT_PENDING_LIMIT,      16).
--define(REQ_TIMEOUT_MS,          30000).
+%% TS 29.274 section 7.6: a request that gets no response within
+%% T3-RESPONSE is retransmitted, with the same sequence number, up to
+%% N3-REQUESTS times. Both are operator-configurable; these are the
+%% common defaults. Up to 0.0.99 a request was sent once with a 30 s
+%% timer, so a single lost datagram failed the attach (KI-52).
+-define(DEFAULT_T3_RESPONSE_MS,   3000).
+-define(DEFAULT_N3_REQUESTS,         3).
+%% Margin a caller waits beyond the last possible retransmission.
+-define(CALL_TIMEOUT_MARGIN_MS,   5000).
 
 -record(pending_call, {
     from       :: {pid(), reference()},
@@ -47,7 +55,11 @@
     params     :: map(),
     seq        :: non_neg_integer(),
     epoch      :: non_neg_integer(),
-    timer_ref  :: reference()
+    timer_ref  :: reference(),
+    %% The encoded request, resent unchanged on T3 expiry.
+    msg        :: binary(),
+    %% Retransmissions so far (0 after the first send).
+    retrans    :: non_neg_integer()
 }).
 
 -record(state, {
@@ -67,7 +79,9 @@
     down_since    :: integer() | undefined,
     backoff_ms    :: non_neg_integer(),
     echo_seq      :: non_neg_integer(),
-    echo_pending  :: {reference(), non_neg_integer()} | undefined,
+    %% {timer, seq, retransmissions so far, encoded request}
+    echo_pending  :: {reference(), non_neg_integer(), non_neg_integer(), binary()}
+                   | undefined,
     echo_misses   :: non_neg_integer(),
     %% Tunables read from config at startup
     echo_interval_ms  :: non_neg_integer(),
@@ -75,7 +89,9 @@
     echo_max_misses   :: non_neg_integer(),
     backoff_max_ms    :: non_neg_integer(),
     max_down_sec      :: non_neg_integer(),
-    pending_limit     :: non_neg_integer()
+    pending_limit     :: non_neg_integer(),
+    t3_response_ms    :: non_neg_integer(),
+    n3_requests       :: non_neg_integer()
 }).
 
 %%====================================================================
@@ -87,11 +103,21 @@ start_link() ->
 
 -spec create_session_request(map()) -> {ok, map()} | {error, term()}.
 create_session_request(Params) ->
-    gen_server:call(?SERVER, {create_session, Params}, 45000).
+    gen_server:call(?SERVER, {create_session, Params}, call_timeout()).
 
 -spec delete_session_request(map()) -> {ok, map()} | {error, term()}.
 delete_session_request(Params) ->
-    gen_server:call(?SERVER, {delete_session, Params}, 30000).
+    gen_server:call(?SERVER, {delete_session, Params}, call_timeout()).
+
+%% How long a caller waits for an answer: the initial send, N3
+%% retransmissions, a margin. Derived from the same configuration as the
+%% client's own timers, so a caller never gives up before the client does
+%% (two literal timeouts used to race, 30 s against 30 s).
+-spec call_timeout() -> pos_integer().
+call_timeout() ->
+    T3 = epdg_config:get(gtpc_t3_response_ms, ?DEFAULT_T3_RESPONSE_MS),
+    N3 = epdg_config:get(gtpc_n3_requests, ?DEFAULT_N3_REQUESTS),
+    T3 * (N3 + 1) + ?CALL_TIMEOUT_MARGIN_MS.
 
 %% Send a triggered response to a PGW-initiated bearer request. Called by the
 %% owning UE FSM once it has (un)installed the dedicated bearer's data-plane
@@ -124,6 +150,8 @@ init([]) ->
                                 ?DEFAULT_BACKOFF_MAX_MS div 1000),
     MaxDown  = epdg_config:get(gtpc_max_down_sec, ?DEFAULT_MAX_DOWN_SEC),
     PendLim  = epdg_config:get(gtpc_pending_limit, ?DEFAULT_PENDING_LIMIT),
+    T3       = epdg_config:get(gtpc_t3_response_ms, ?DEFAULT_T3_RESPONSE_MS),
+    N3       = epdg_config:get(gtpc_n3_requests, ?DEFAULT_N3_REQUESTS),
 
     InetFamily = case BindAddr of
         {_,_,_,_,_,_,_,_} -> inet6;
@@ -162,7 +190,9 @@ init([]) ->
                 echo_max_misses  = EchoMax,
                 backoff_max_ms   = BackMax * 1000,
                 max_down_sec     = MaxDown,
-                pending_limit    = PendLim
+                pending_limit    = PendLim,
+                t3_response_ms   = T3,
+                n3_requests      = N3
             },
             schedule_echo(State0),
             {ok, State0};
@@ -202,14 +232,24 @@ handle_cast(_, State) -> {noreply, State}.
 handle_info({udp, _Sock, _FromIP, _FromPort, Data}, State) ->
     {noreply, handle_udp(Data, State)};
 
-%% SPEC-DEVIATION: TS 29.274 section 7.6 -- a request that gets no response
-%% is not retransmitted (T3-RESPONSE / N3-REQUESTS); it fails after one
-%% timeout, so a single lost datagram fails the attach (KI-52).
+%% T3-RESPONSE expired for a request (TS 29.274 section 7.6): resend the
+%% same datagram until N3-REQUESTS retransmissions are used up, then fail
+%% the call. A failed request does not mark the peer down on its own: that
+%% would end every UE's session (pgw_down), and the lost datagrams seen so
+%% far (KI-52) came with a PGW that was fine. Path failure is the Echo
+%% procedure's job (also retransmitted now).
 handle_info({timeout, Ref, {seq_timeout, SeqNum, Epoch}},
-            #state{pending = Pending} = State) ->
+            #state{pending = Pending, n3_requests = N3} = State) ->
     case maps:find(SeqNum, Pending) of
-        {ok, #pending_call{timer_ref = Ref, epoch = Epoch, from = From}} ->
+        {ok, #pending_call{timer_ref = Ref, epoch = Epoch,
+                           retrans = R} = Call} when R < N3 ->
+            {noreply, retransmit(Call, State)};
+        {ok, #pending_call{timer_ref = Ref, epoch = Epoch, from = From,
+                           kind = Kind, retrans = R}} ->
             epdg_metrics:inc(gtpc_timeouts_total),
+            epdg_metrics:inc(gtpc_request_failures_total),
+            logger:warning("GTP-C ~p seq=~B: no response after ~B sends",
+                           [Kind, SeqNum, R + 1]),
             gen_server:reply(From, {error, timeout}),
             State1 = State#state{pending = maps:remove(SeqNum, Pending)},
             {noreply, State1};
@@ -220,7 +260,22 @@ handle_info({timeout, _Ref, echo_tick}, State) ->
     {noreply, send_echo(State)};
 
 handle_info({timeout, Ref, {echo_timeout, EchoSeq, Epoch}},
-            #state{echo_pending = {Ref, EchoSeq}, epoch = Epoch} = State) ->
+            #state{echo_pending = {Ref, EchoSeq, R, Msg}, epoch = Epoch,
+                   n3_requests = N3, echo_timeout_ms = Timeout} = State)
+  when R < N3 ->
+    %% Same retransmission rule as for session requests; a miss is
+    %% counted only when every retransmission went unanswered.
+    case resolve_and_send(Msg, State) of
+        ok ->
+            epdg_metrics:inc(gtpc_retransmissions_total),
+            TRef = erlang:start_timer(Timeout, self(),
+                                      {echo_timeout, EchoSeq, Epoch}),
+            {noreply, State#state{echo_pending = {TRef, EchoSeq, R + 1, Msg}}};
+        _ ->
+            {noreply, handle_echo_timeout(State)}
+    end;
+handle_info({timeout, Ref, {echo_timeout, EchoSeq, Epoch}},
+            #state{echo_pending = {Ref, EchoSeq, _, _}, epoch = Epoch} = State) ->
     {noreply, handle_echo_timeout(State)};
 handle_info({timeout, _Ref, {echo_timeout, _, _}}, State) ->
     {noreply, State};
@@ -348,7 +403,13 @@ to_binary(A) when is_atom(A)   -> atom_to_binary(A, utf8).
 send_delete_session(Params, From,
                     #state{seq_num = Seq, epoch = Epoch} = State) ->
     PgwTEID = maps:get(pgw_c_teid, Params, maps:get(pgw_teid, Params, 0)),
-    EBI     = maps:get(ebi, Params, 5),
+    %% The linked EBI is a 4-bit field; a Create Session Response without
+    %% an EBI leaves `undefined' in the session, which must not reach the
+    %% encoder. 5 is the default-bearer EBI the ePDG requested.
+    EBI     = case maps:get(ebi, Params, 5) of
+        E when is_integer(E), E >= 5, E =< 15 -> E;
+        _                                     -> 5
+    end,
     Msg = epdg_gtpc_codec:encode_delete_session_request(#{
         seq_num => Seq, teid => PgwTEID, ebi => EBI}),
     deliver_and_pend(Msg, delete_session, Params, Seq, Epoch, From, State).
@@ -362,11 +423,12 @@ deliver_and_pend(Msg, Kind, Params, Seq, Epoch, From,
                 ok ->
                     epdg_metrics:inc(gtpc_requests_total),
                     TRef = erlang:start_timer(
-                              ?REQ_TIMEOUT_MS, self(),
+                              State1#state.t3_response_ms, self(),
                               {seq_timeout, Seq, Epoch}),
                     Call = #pending_call{from = From, kind = Kind,
                                           params = Params, seq = Seq,
-                                          epoch = Epoch, timer_ref = TRef},
+                                          epoch = Epoch, timer_ref = TRef,
+                                          msg = Msg, retrans = 0},
                     State1#state{seq_num = (Seq + 1) band 16#FFFFFF,
                                   pending = Pending#{Seq => Call}};
                 {error, SendErr} ->
@@ -379,6 +441,32 @@ deliver_and_pend(Msg, Kind, Params, Seq, Epoch, From,
             gen_server:reply(From, {error, {resolve_failed, Reason}}),
             mark_peer_down(State1)
     end.
+
+%% Resend a pending request unchanged (same sequence number) and re-arm T3.
+retransmit(#pending_call{seq = Seq, epoch = Epoch, msg = Msg, retrans = R,
+                         kind = Kind, from = From} = Call,
+           #state{pending = Pending, t3_response_ms = T3} = State) ->
+    case resolve_and_send(Msg, State) of
+        ok ->
+            epdg_metrics:inc(gtpc_retransmissions_total),
+            logger:info("GTP-C ~p seq=~B: retransmission ~B", [Kind, Seq, R + 1]),
+            TRef = erlang:start_timer(T3, self(), {seq_timeout, Seq, Epoch}),
+            State#state{pending = Pending#{Seq => Call#pending_call{
+                                                     timer_ref = TRef,
+                                                     retrans = R + 1}}};
+        {error, Reason} ->
+            gen_server:reply(From, {error, Reason}),
+            mark_peer_down(invalidate_dns(
+                State#state{pending = maps:remove(Seq, Pending)}))
+    end.
+
+%% Fail every pending call; the caller gets `Reason'.
+fail_pending(Reason, #state{pending = Pending} = State) ->
+    maps:foreach(fun(_Seq, #pending_call{from = From, timer_ref = Ref}) ->
+                     erlang:cancel_timer(Ref),
+                     gen_server:reply(From, {error, Reason})
+                 end, Pending),
+    State#state{pending = #{}}.
 
 %%====================================================================
 %% Peer IP resolution (via cache)
@@ -420,7 +508,7 @@ send_echo(#state{socket = Socket, pgw_port = Port,
                               Timeout, self(),
                               {echo_timeout, Seq, Epoch}),
                     State1#state{echo_seq = Seq,
-                                  echo_pending = {TRef, Seq}};
+                                  echo_pending = {TRef, Seq, 0, Msg}};
                 {error, _} ->
                     mark_peer_down(invalidate_dns(State1))
             end;
@@ -445,9 +533,12 @@ handle_echo_timeout(#state{echo_misses = M, echo_max_misses = MaxM} = State) ->
 %%====================================================================
 
 mark_peer_down(#state{peer_state = down} = State) -> State;
-mark_peer_down(State) ->
+mark_peer_down(State0) ->
     epdg_metrics:inc(gtpc_peer_down_total),
     catch epdg_ue_registry:broadcast(pgw_down),
+    %% Nothing in flight will be answered; tell the callers now instead
+    %% of letting their timers run out.
+    State = fail_pending(peer_down, State0),
     State1 = State#state{peer_state = down,
                           down_since = erlang:system_time(second),
                           backoff_ms = ?DEFAULT_BACKOFF_START_MS,
@@ -507,7 +598,7 @@ handle_udp(Data, State) ->
 dispatch_gtpc_msg(#{type := 2, seq_num := Seq} = Msg, State) ->
     %% Echo Response — clear pending echo, update Recovery
     State1 = case State#state.echo_pending of
-        {TRef, Seq} ->
+        {TRef, Seq, _, _} ->
             erlang:cancel_timer(TRef),
             State#state{echo_pending = undefined, echo_misses = 0};
         _ -> State
@@ -590,10 +681,16 @@ encode_bearer_response(update, R) ->
 encode_bearer_response(delete, R) ->
     epdg_gtpc_codec:encode_delete_bearer_response(R).
 
+-spec resolve_and_send(binary(), #state{}) -> ok | {error, term()}.
 resolve_and_send(Bin, #state{socket = S, pgw_port = P} = State) ->
     case resolved_peer_ip(State) of
-        {ok, IP, _} -> catch gen_udp:send(S, IP, P, Bin), ok;
-        _ -> ok
+        {ok, IP, _} ->
+            case gen_udp:send(S, IP, P, Bin) of
+                ok         -> ok;
+                {error, R} -> {error, R}
+            end;
+        {error, R, _} ->
+            {error, {resolve_failed, R}}
     end.
 
 deliver_response(Seq, Msg, #state{pending = Pending, epoch = Epoch} = State0, Kind) ->
@@ -611,8 +708,11 @@ deliver_response(Seq, Msg, #state{pending = Pending, epoch = Epoch} = State0, Ki
             gen_server:reply(From, Decoded),
             State1 = State0#state{pending = maps:remove(Seq, Pending)},
             apply_recovery(Msg, mark_peer_up(State1));
-        {ok, _Stale} ->
-            %% Stale epoch — drop
+        {ok, #pending_call{from = From, timer_ref = Ref}} ->
+            %% Stale epoch: the PGW restarted since the request was sent,
+            %% so this answer describes a session that is gone.
+            erlang:cancel_timer(Ref),
+            gen_server:reply(From, {error, pgw_restarted}),
             State0#state{pending = maps:remove(Seq, Pending)};
         error ->
             apply_recovery(Msg, State0)
@@ -642,9 +742,8 @@ update_recovery(RNew, #state{peer_recovery = ROld, epoch = Epoch} = State) ->
                    [ROld, RNew]),
     epdg_metrics:inc(gtpc_peer_restarts_total),
     catch epdg_ue_registry:broadcast(pgw_restart),
-    State#state{peer_recovery = RNew,
-                 epoch = Epoch + 1,
-                 pending = #{}}.
+    (fail_pending(pgw_restarted, State))#state{peer_recovery = RNew,
+                                               epoch = Epoch + 1}.
 
 %%====================================================================
 %% Helpers

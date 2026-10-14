@@ -133,6 +133,9 @@ init() ->
     set_from_env_int("EPDG_GTPC_BACKOFF_MAX_SEC", gtpc_backoff_max_sec, 30),
     set_from_env_int("EPDG_GTPC_MAX_DOWN_SEC", gtpc_max_down_sec, 30),
     set_from_env_int("EPDG_GTPC_PENDING_LIMIT", gtpc_pending_limit, 16),
+    %% TS 29.274 section 7.6 retransmission timer and count (KI-52).
+    set_from_env_int("EPDG_GTPC_T3_RESPONSE_MS", gtpc_t3_response_ms, 3000),
+    set_from_env_int("EPDG_GTPC_N3_REQUESTS", gtpc_n3_requests, 3),
     set_from_env_int("EPDG_DNS_MIN_TTL_SEC", dns_min_ttl_sec, 5),
     set_from_env_int("EPDG_DNS_MAX_TTL_SEC", dns_max_ttl_sec, 60),
     application:set_env(?APP, gtpc_mode,

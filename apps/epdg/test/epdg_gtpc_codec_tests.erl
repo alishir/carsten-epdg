@@ -258,3 +258,16 @@ delete_bearer_request_decode_test() ->
     R = epdg_gtpc_codec:decode_delete_bearer_request(Decoded),
     ?assertEqual(3, maps:get(seq_num, R)),
     ?assertEqual([6], maps:get(ebis, R)).
+
+%% KI-4: the Delete Session Request must address the PGW's S2b control
+%% TEID in the header and name the linked EBI (TS 29.274 §7.2.9.1), from
+%% the map the UE FSM builds (epdg_ue_fsm:pgw_delete_params/1).
+delete_session_request_carries_pgw_teid_and_linked_ebi_test() ->
+    Bin = epdg_gtpc_codec:encode_delete_session_request(
+            #{seq_num => 7, teid => 16#1234, ebi => 5}),
+    {ok, Hdr} = epdg_gtpc_codec:decode_header(Bin),
+    ?assertEqual(36, maps:get(type, Hdr)),
+    ?assertEqual(16#1234, maps:get(teid, Hdr)),
+    ?assertEqual(7, maps:get(seq_num, Hdr)),
+    %% EBI IE: type 73, length 1, instance 0, spare nibble + EBI 5
+    ?assertNotEqual(nomatch, binary:match(Bin, <<73:8, 1:16, 0:8, 0:4, 5:4>>)).
