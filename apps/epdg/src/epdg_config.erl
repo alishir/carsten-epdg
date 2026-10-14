@@ -4,6 +4,7 @@
 %%%-------------------------------------------------------------------
 -module(epdg_config).
 
+-export([udp_socket_opts/0]).
 -export([init/0, get/1, get/2, parse_gtpc_mode/1, parse_ue_ip_pools/1,
          parse_instance_id/2, parse_legacy_dh_groups/1, parse_bool/2,
          parse_trace_local_addrs/1, default_ike_id_fqdn/0]).
@@ -12,6 +13,15 @@
 -include("epdg_ipv6.hrl").
 
 -define(APP, epdg).
+
+%% Receive buffer for the ePDG's UDP sockets (IKE 500/4500, GTP-C, GTP-U).
+%% gen_udp opens them with 8 kB (16 kB in the kernel), which holds four to
+%% seven datagrams: S2b Create Session Responses that arrived in a burst were
+%% dropped by the kernel and the attach failed with a GTP-C timeout 30 s
+%% later. The kernel caps the value at net.core.rmem_max.
+-spec udp_socket_opts() -> [gen_udp:option()].
+udp_socket_opts() ->
+    [{recbuf, 4194304}].
 
 init() ->
     %% Diameter identity

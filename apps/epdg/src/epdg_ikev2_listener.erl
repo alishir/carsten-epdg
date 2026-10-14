@@ -52,7 +52,7 @@ init([]) ->
 
     InetFamily = ip_family(BindAddr),
     Opts = [binary, {ip, BindAddr}, {active, true}, {reuseaddr, true}, InetFamily]
-           ++ ipv6_opts(InetFamily),
+           ++ ipv6_opts(InetFamily) ++ epdg_config:udp_socket_opts(),
 
     case gen_udp:open(Port, Opts) of
         {ok, S500} ->

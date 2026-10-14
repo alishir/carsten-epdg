@@ -130,7 +130,8 @@ init([]) ->
         _                 -> inet
     end,
     case gen_udp:open(Port, [binary, {ip, BindAddr}, {active, true},
-                              {reuseaddr, true}, InetFamily]) of
+                              {reuseaddr, true}, InetFamily]
+                             ++ epdg_config:udp_socket_opts()) of
         {ok, Socket} ->
             {ok, {LIP, _}} = inet:sockname(Socket),
             LocalUIP = resolve_local_u_ip(epdg_config:get(gtpu_advertise_addr, ""),
@@ -201,6 +202,9 @@ handle_cast(_, State) -> {noreply, State}.
 handle_info({udp, _Sock, _FromIP, _FromPort, Data}, State) ->
     {noreply, handle_udp(Data, State)};
 
+%% SPEC-DEVIATION: TS 29.274 section 7.6 -- a request that gets no response
+%% is not retransmitted (T3-RESPONSE / N3-REQUESTS); it fails after one
+%% timeout, so a single lost datagram fails the attach (KI-52).
 handle_info({timeout, Ref, {seq_timeout, SeqNum, Epoch}},
             #state{pending = Pending} = State) ->
     case maps:find(SeqNum, Pending) of

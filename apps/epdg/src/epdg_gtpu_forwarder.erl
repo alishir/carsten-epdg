@@ -341,7 +341,8 @@ init_datapath(Pools) ->
         _                 -> inet
     end,
     case gen_udp:open(Port, [binary, {ip, BindIp}, {active, true},
-                              {reuseaddr, true}, InetFamily]) of
+                              {reuseaddr, true}, InetFamily]
+                             ++ epdg_config:udp_socket_opts()) of
         {ok, Socket} ->
             logger:info("GTP-U forwarder on ~p:~p (shared TUN ~s, ~B UE "
                         "pool(s))", [BindIp, Port, TunName, length(Pools)]),

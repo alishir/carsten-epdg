@@ -201,3 +201,16 @@ ike_id_fqdn_defaults_to_public_epdg_fqdn_test() ->
                  epdg_config:default_ike_id_fqdn()),
     os:unsetenv("MCC"),
     os:unsetenv("MNC").
+
+%% Answers from the PGW arrive in bursts and the receiving process is not
+%% always scheduled at once. With the socket default (16 kB in the kernel) a
+%% burst of a handful of S2b responses overflowed the buffer and each lost
+%% response failed one attach, so the sockets must ask for far more.
+udp_sockets_ask_for_a_large_receive_buffer_test() ->
+    {ok, Default} = gen_udp:open(0, [binary]),
+    {ok, Sized}   = gen_udp:open(0, [binary | epdg_config:udp_socket_opts()]),
+    {ok, [{recbuf, D}]} = inet:getopts(Default, [recbuf]),
+    {ok, [{recbuf, S}]} = inet:getopts(Sized, [recbuf]),
+    gen_udp:close(Default),
+    gen_udp:close(Sized),
+    ?assert(S >= 4 * D).
