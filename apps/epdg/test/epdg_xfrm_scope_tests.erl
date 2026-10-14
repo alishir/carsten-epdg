@@ -37,6 +37,9 @@ xfrm_scope_test_() ->
       fun foreign_policies_never_reach_the_beam/1]}.
 
 setup() ->
+    %% These tests are about the `ip' pipelines: pin the ip backend.
+    application:set_env(epdg, xfrm_backend, "ip"),
+    application:set_env(epdg, xfrm_backend_effective, ip),
     Base = case os:getenv("TMPDIR") of false -> "/tmp"; T -> T end,
     Dir  = filename:join(Base, "epdg_xfrm_scope_"
                          ++ integer_to_list(erlang:unique_integer([positive]))),
@@ -62,6 +65,8 @@ setup() ->
     {Dir, Log, OldPath}.
 
 cleanup({Dir, _Log, OldPath}) ->
+    application:unset_env(epdg, xfrm_backend),
+    application:unset_env(epdg, xfrm_backend_effective),
     true = os:putenv("PATH", OldPath),
     _ = [file:delete(F) || F <- filelib:wildcard(filename:join(Dir, "*"))],
     _ = file:del_dir(Dir),

@@ -39,6 +39,9 @@ xfrm_cmd_test_() ->
       fun other_mode_delete_addresses_the_other_scope/1]}.
 
 setup() ->
+    %% These tests are about the `ip' command strings: pin the ip backend.
+    application:set_env(epdg, xfrm_backend, "ip"),
+    application:set_env(epdg, xfrm_backend_effective, ip),
     Base = case os:getenv("TMPDIR") of false -> "/tmp"; T -> T end,
     Dir  = filename:join(Base, "epdg_xfrm_cmd_"
                          ++ integer_to_list(erlang:unique_integer([positive]))),
@@ -61,6 +64,8 @@ setup() ->
 
 cleanup({Dir, _Log, OldPath, Pid}) ->
     gen_server:stop(Pid),
+    application:unset_env(epdg, xfrm_backend),
+    application:unset_env(epdg, xfrm_backend_effective),
     true = os:putenv("PATH", OldPath),
     _ = [file:delete(F) || F <- filelib:wildcard(filename:join(Dir, "*"))],
     _ = file:del_dir(Dir),

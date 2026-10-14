@@ -79,6 +79,9 @@ init() ->
     %% epdg_gtpu_forwarder:setup_xfrm_if/5). "false" keeps them in the
     %% node's global policy table, as all releases up to 0.0.91 did.
     set_from_env("EPDG_XFRM_INTERFACE", xfrm_interface, "true"),
+    %% "netlink" (default): SAs, policies and routes over AF_NETLINK from
+    %% Erlang; "ip": the `ip xfrm' / `ip route' commands used up to 0.0.100.
+    set_from_env("EPDG_XFRM_BACKEND", xfrm_backend, "netlink"),
     %% MTU of that interface: the largest inner packet that goes into one
     %% ESP packet. Must leave room for the tunnel overhead (up to ~90 bytes
     %% with NAT-T) below the smallest MTU on the way to the UE.

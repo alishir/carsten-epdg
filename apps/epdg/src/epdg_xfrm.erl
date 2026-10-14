@@ -1,6 +1,9 @@
 %%%-------------------------------------------------------------------
 %%% @doc Linux XFRM interface for kernel IPsec SA/SP management.
-%%% Uses ip-xfrm commands; production should migrate to gen_netlink.
+%%% Two backends: netlink (epdg_xfrm_nl, the default, no process spawn)
+%%% and `ip xfrm' commands (EPDG_XFRM_BACKEND=ip, the previous behaviour,
+%%% kept for comparison and as a fallback when NETLINK_XFRM is not
+%%% available to the process).
 %%% Supports hardware offload detection (NIC inline / Intel QAT).
 %%% @end
 %%%-------------------------------------------------------------------
@@ -29,7 +32,8 @@
 
 -record(state, {
     offload_mode :: none | inline | crypto,
-    iface        :: string()
+    iface        :: string(),
+    backend      :: netlink | ip
 }).
 
 %%====================================================================
@@ -91,8 +95,12 @@ flush_all() ->
           [#{src := inet:ip_address(), dst := inet:ip_address(),
              spi := non_neg_integer(), reqid := non_neg_integer()}].
 list_sas(LocalIP) ->
-    lists:usort(lists:append(
-        [parse_state_list(os:cmd(Cmd)) || Cmd <- state_list_cmds(LocalIP)])).
+    case backend() of
+        netlink -> epdg_xfrm_nl:list_sas(LocalIP);
+        ip ->
+            lists:usort(lists:append(
+                [parse_state_list(os:cmd(Cmd)) || Cmd <- state_list_cmds(LocalIP)]))
+    end.
 
 %% Inventory of the XFRM policies whose first template has LocalIP as an
 %% outer endpoint: selector src/dst (CIDR strings, exactly as `ip xfrm
@@ -111,7 +119,10 @@ list_sas(LocalIP) ->
              tmpl_dst := inet:ip_address() | undefined,
              reqid := non_neg_integer()}].
 list_policies(LocalIP) ->
-    parse_policy_list(os:cmd(policy_list_cmd(LocalIP))).
+    case backend() of
+        netlink -> epdg_xfrm_nl:list_policies(LocalIP);
+        ip      -> parse_policy_list(os:cmd(policy_list_cmd(LocalIP)))
+    end.
 
 %%====================================================================
 %% gen_server callbacks
@@ -129,8 +140,32 @@ init([]) ->
         _        -> none
     end,
 
-    logger:info("XFRM: offload_mode=~p iface=~s", [Mode, Iface]),
-    {ok, #state{offload_mode = Mode, iface = Iface}}.
+    Backend = case epdg_config:get(xfrm_backend, "netlink") of
+        "ip" -> ip;
+        _ ->
+            case epdg_xfrm_nl:available() of
+                true  -> netlink;
+                false ->
+                    logger:warning("XFRM: NETLINK_XFRM not available to this process "
+                                   "(NET_ADMIN?), falling back to ip commands"),
+                    ip
+            end
+    end,
+    %% list_sas/1 and list_policies/1 run in the calling process.
+    application:set_env(epdg, xfrm_backend_effective, Backend),
+    logger:info("XFRM: backend=~p offload_mode=~p iface=~s", [Backend, Mode, Iface]),
+    {ok, #state{offload_mode = Mode, iface = Iface, backend = Backend}}.
+
+%% The backend chosen at start, for the functions that run outside the server.
+backend() ->
+    case application:get_env(epdg, xfrm_backend_effective) of
+        {ok, B} -> B;
+        undefined ->
+            case epdg_config:get(xfrm_backend, "netlink") of
+                "ip" -> ip;
+                _    -> netlink
+            end
+    end.
 
 %% Each of these runs an `ip xfrm` command. They are executed in a process of
 %% their own and answered with gen_server:reply/2: inside this server the
@@ -141,20 +176,23 @@ init([]) ->
 handle_call({create_sa, Params}, From, State) ->
     async_reply(From, fun() -> do_create_sa(Params, State) end),
     {noreply, State};
-handle_call({delete_sa, Params}, From, State) ->
-    async_reply(From, fun() -> do_delete_sa(Params) end),
+handle_call({delete_sa, Params}, From, #state{backend = B} = State) ->
+    async_reply(From, fun() -> do_delete_sa(B, Params) end),
     {noreply, State};
-handle_call({flush_sa_endpoint, Params}, From, State) ->
-    async_reply(From, fun() -> do_flush_sa_endpoint(Params) end),
+handle_call({flush_sa_endpoint, Params}, From, #state{backend = B} = State) ->
+    async_reply(From, fun() -> do_flush_sa_endpoint(B, Params) end),
     {noreply, State};
-handle_call({create_policy, Params}, From, State) ->
-    async_reply(From, fun() -> do_create_policy(Params) end),
+handle_call({create_policy, Params}, From, #state{backend = B} = State) ->
+    async_reply(From, fun() -> do_create_policy(B, Params) end),
     {noreply, State};
-handle_call({delete_policy, Params}, From, State) ->
-    async_reply(From, fun() -> do_delete_policy(Params) end),
+handle_call({delete_policy, Params}, From, #state{backend = B} = State) ->
+    async_reply(From, fun() -> do_delete_policy(B, Params) end),
     {noreply, State};
 handle_call(get_offload_mode, _From, #state{offload_mode = M} = State) ->
     {reply, M, State};
+handle_call(flush_all, _From, #state{backend = netlink} = State) ->
+    epdg_xfrm_nl:flush_all(),
+    {reply, ok, State};
 handle_call(flush_all, _From, State) ->
     os:cmd("ip xfrm state flush 2>/dev/null"),
     os:cmd("ip xfrm policy flush 2>/dev/null"),
@@ -182,6 +220,14 @@ code_change(_OldVsn, State, _Extra) -> {ok, State}.
 %% SA management
 %%====================================================================
 
+do_create_sa(Params, #state{backend = netlink, offload_mode = Offload, iface = Iface}) ->
+    case epdg_xfrm_nl:create_sa(Params, Offload, Iface, xfrm_if()) of
+        ok ->
+            epdg_metrics:inc(xfrm_sa_created_total),
+            epdg_metrics:gauge_inc(xfrm_sa_active),
+            ok;
+        E -> E
+    end;
 do_create_sa(#{spi := SPI, src_ip := Src, dst_ip := Dst,
                enc_alg := EncAlg, enc_key := EncKey} = Params,
              #state{offload_mode = Offload, iface = Iface}) ->
@@ -294,6 +340,14 @@ do_create_sa(#{spi := SPI, src_ip := Src, dst_ip := Dst,
 do_create_sa(_, _) ->
     {error, invalid_params}.
 
+do_delete_sa(netlink, Params) ->
+    R = epdg_xfrm_nl:delete_sa(Params),
+    epdg_metrics:inc(xfrm_sa_deleted_total),
+    epdg_metrics:gauge_dec(xfrm_sa_active),
+    case R of {error, invalid_params} = E -> E; _ -> ok end;
+do_delete_sa(ip, Params) ->
+    do_delete_sa(Params).
+
 do_delete_sa(#{spi := SPI, src_ip := Src, dst_ip := Dst}) ->
     Cmd = io_lib:format(
         "ip xfrm state delete src ~s dst ~s proto esp spi 0x~.16B",
@@ -316,6 +370,14 @@ do_delete_sa(_) ->
 %% so this removes any stale SAs left over from a UE IKE_AUTH retransmit
 %% or a re-dial whose previous FSM did not tear down cleanly — without
 %% needing to know their (random responder) SPIs.
+do_flush_sa_endpoint(netlink, Params) ->
+    case epdg_xfrm_nl:flush_sa_endpoint(Params) of
+        {error, invalid_params} = E -> E;
+        _ -> ok
+    end;
+do_flush_sa_endpoint(ip, Params) ->
+    do_flush_sa_endpoint(Params).
+
 do_flush_sa_endpoint(#{src_ip := Src, dst_ip := Dst}) ->
     Cmd = io_lib:format(
         "ip xfrm state deleteall src ~s dst ~s proto esp 2>/dev/null",
@@ -340,6 +402,17 @@ do_flush_sa_endpoint(_) ->
 %% single transport-mode template rejects that (XfrmInTmplMismatch). A
 %% priority cannot fix both directions; what does is taking these policies
 %% out of the shared table ("XFRM interface scoping" below).
+do_create_policy(netlink, #{dst := Dst, direction := Dir} = Params) ->
+    If = xfrm_if(),
+    case epdg_xfrm_nl:create_policy(Params, If) of
+        ok -> local_route(netlink, replace, Dir, Dst, If);
+        E  -> E
+    end;
+do_create_policy(netlink, _) ->
+    {error, invalid_params};
+do_create_policy(ip, Params) ->
+    do_create_policy(Params).
+
 do_create_policy(#{src := Src, dst := Dst, direction := Dir,
                    tmpl_src := TSrc, tmpl_dst := TDst} = Params) ->
     %% `update` (create-or-replace), not `add` (create-exclusive): a UE
@@ -356,11 +429,33 @@ do_create_policy(#{src := Src, dst := Dst, direction := Dir,
         [Src, Dst, dir_str(Dir), if_id_part(If),
          ip_str(TSrc), ip_str(TDst), Reqid]),
     case run_cmd(lists:flatten(Cmd)) of
-        ok -> local_route(replace, Dir, Dst, If);
+        ok -> local_route(ip, replace, Dir, Dst, If);
         E  -> E
     end;
 do_create_policy(_) ->
     {error, invalid_params}.
+
+do_delete_policy(netlink, #{dst := Dst, direction := Dir} = Params) ->
+    OtherMode = maps:get(other_mode, Params, false),
+    If = case OtherMode of
+        false -> xfrm_if();
+        true  -> other_mode_if()
+    end,
+    _ = local_route(netlink, del, Dir, Dst, If),
+    case epdg_xfrm_nl:delete_policy(Params, If) of
+        ok -> ok;
+        Error when OtherMode -> Error;
+        Error ->
+            %% see the ip variant below: a policy of the other scope
+            case do_delete_policy(netlink, Params#{other_mode => true}) of
+                ok -> ok;
+                _  -> Error
+            end
+    end;
+do_delete_policy(netlink, _) ->
+    {error, invalid_params};
+do_delete_policy(ip, Params) ->
+    do_delete_policy(Params).
 
 do_delete_policy(#{src := Src, dst := Dst, direction := Dir} = Params) ->
     OtherMode = maps:get(other_mode, Params, false),
@@ -371,7 +466,7 @@ do_delete_policy(#{src := Src, dst := Dst, direction := Dir} = Params) ->
     Cmd = io_lib:format(
         "ip xfrm policy delete src ~s dst ~s dir ~s~s",
         [Src, Dst, dir_str(Dir), if_id_part(If)]),
-    _ = local_route(del, Dir, Dst, If),
+    _ = local_route(ip, del, Dir, Dst, If),
     case run_cmd(lists:flatten(Cmd)) of
         ok ->
             ok;
@@ -434,7 +529,12 @@ if_id_part(_)           -> "".
 %% applies to it any more. One host route per attached UE in the instance's
 %% local-origin table, which `iif lo' consults; it travels with the
 %% outbound policy because that is the policy it feeds.
-local_route(Op, out, Dst, #{name := Name, local_table := Table}) ->
+local_route(netlink, Op, out, Dst, #{name := Name, local_table := Table}) ->
+    case {Op, epdg_xfrm_nl:route(Op, Dst, Name, Table)} of
+        {replace, R} -> R;
+        {del, _}     -> ok
+    end;
+local_route(ip, Op, out, Dst, #{name := Name, local_table := Table}) ->
     Fam = case lists:member($:, Dst) of true -> "ip -6"; false -> "ip" end,
     Cmd = io_lib:format("~s route ~s ~s dev ~s table ~B",
                         [Fam, atom_to_list(Op), Dst, Name, Table]),
@@ -442,7 +542,7 @@ local_route(Op, out, Dst, #{name := Name, local_table := Table}) ->
         replace -> run_cmd(lists:flatten(Cmd));
         del     -> _ = os:cmd(lists:flatten(Cmd) ++ " 2>/dev/null"), ok
     end;
-local_route(_Op, _Dir, _Dst, _If) ->
+local_route(_Backend, _Op, _Dir, _Dst, _If) ->
     ok.
 
 %%====================================================================
