@@ -33,7 +33,10 @@
 -record(state, {
     offload_mode :: none | inline | crypto,
     iface        :: string(),
-    backend      :: netlink | ip
+    backend      :: netlink | ip,
+    %% Static policy mode: the {if_id, family} pairs whose inbound and
+    %% forward wildcard policies are in the kernel (see ensure_static/3).
+    static = #{} :: #{{non_neg_integer(), inet | inet6} => true}
 }).
 
 %%====================================================================
@@ -182,9 +185,39 @@ handle_call({delete_sa, Params}, From, #state{backend = B} = State) ->
 handle_call({flush_sa_endpoint, Params}, From, #state{backend = B} = State) ->
     async_reply(From, fun() -> do_flush_sa_endpoint(B, Params) end),
     {noreply, State};
+%% Inbound and forward policies: in static mode a UE needs none of its own,
+%% only the interface's wildcard pair for its address family, installed on
+%% first use. That install runs in this process on purpose: it happens twice
+%% per interface and must not race with itself.
+handle_call({create_policy, #{direction := Dir} = Params}, From,
+            #state{backend = B} = State) when Dir =/= out ->
+    case static_mode() of
+        true ->
+            {Reply, State2} = ensure_static(B, Params, State),
+            {reply, Reply, State2};
+        false ->
+            async_reply(From, fun() -> do_create_policy(B, Params) end),
+            {noreply, State}
+    end;
 handle_call({create_policy, Params}, From, #state{backend = B} = State) ->
     async_reply(From, fun() -> do_create_policy(B, Params) end),
     {noreply, State};
+handle_call({delete_policy, #{direction := Dir} = Params}, From,
+            #state{backend = B} = State) when Dir =/= out ->
+    %% A UE has no inbound or forward policy of its own in static mode, so
+    %% its FSM's delete is a no-op. The reconciler (`force`) and the
+    %% other-scope clean-up after a mode change (`other_mode`) delete
+    %% per-UE policies a previous incarnation left behind, and those must
+    %% reach the kernel in static mode too.
+    Forced = maps:get(force, Params, false) orelse maps:get(other_mode, Params, false),
+    case static_mode() andalso not Forced of
+        true ->
+            {reply, ok, State};
+        false ->
+            Params1 = maps:remove(force, Params),
+            async_reply(From, fun() -> do_delete_policy(B, Params1) end),
+            {noreply, State}
+    end;
 handle_call({delete_policy, Params}, From, #state{backend = B} = State) ->
     async_reply(From, fun() -> do_delete_policy(B, Params) end),
     {noreply, State};
@@ -192,11 +225,11 @@ handle_call(get_offload_mode, _From, #state{offload_mode = M} = State) ->
     {reply, M, State};
 handle_call(flush_all, _From, #state{backend = netlink} = State) ->
     epdg_xfrm_nl:flush_all(),
-    {reply, ok, State};
+    {reply, ok, State#state{static = #{}}};
 handle_call(flush_all, _From, State) ->
     os:cmd("ip xfrm state flush 2>/dev/null"),
     os:cmd("ip xfrm policy flush 2>/dev/null"),
-    {reply, ok, State};
+    {reply, ok, State#state{static = #{}}};
 handle_call(_Req, _From, State) ->
     {reply, {error, unknown}, State}.
 
@@ -405,7 +438,7 @@ do_flush_sa_endpoint(_) ->
 do_create_policy(netlink, #{dst := Dst, direction := Dir} = Params) ->
     If = xfrm_if(),
     case epdg_xfrm_nl:create_policy(Params, If) of
-        ok -> local_route(netlink, replace, Dir, Dst, If);
+        ok -> maybe_local_route(netlink, replace, Dir, Dst, If);
         E  -> E
     end;
 do_create_policy(netlink, _) ->
@@ -429,7 +462,7 @@ do_create_policy(#{src := Src, dst := Dst, direction := Dir,
         [Src, Dst, dir_str(Dir), if_id_part(If),
          ip_str(TSrc), ip_str(TDst), Reqid]),
     case run_cmd(lists:flatten(Cmd)) of
-        ok -> local_route(ip, replace, Dir, Dst, If);
+        ok -> maybe_local_route(ip, replace, Dir, Dst, If);
         E  -> E
     end;
 do_create_policy(_) ->
@@ -441,7 +474,7 @@ do_delete_policy(netlink, #{dst := Dst, direction := Dir} = Params) ->
         false -> xfrm_if();
         true  -> other_mode_if()
     end,
-    _ = local_route(netlink, del, Dir, Dst, If),
+    _ = maybe_local_route(netlink, del, Dir, Dst, If),
     case epdg_xfrm_nl:delete_policy(Params, If) of
         ok -> ok;
         Error when OtherMode -> Error;
@@ -466,7 +499,7 @@ do_delete_policy(#{src := Src, dst := Dst, direction := Dir} = Params) ->
     Cmd = io_lib:format(
         "ip xfrm policy delete src ~s dst ~s dir ~s~s",
         [Src, Dst, dir_str(Dir), if_id_part(If)]),
-    _ = local_route(ip, del, Dir, Dst, If),
+    _ = maybe_local_route(ip, del, Dir, Dst, If),
     case run_cmd(lists:flatten(Cmd)) of
         ok ->
             ok;
@@ -524,11 +557,92 @@ other_mode_if() ->
 if_id_part(#{id := Id}) -> io_lib:format(" if_id ~B", [Id]);
 if_id_part(_)           -> "".
 
+%%====================================================================
+%% Static policy mode (EPDG_XFRM_POLICY_MODE=static, default from 0.0.102)
+%%====================================================================
+%%
+%% Every XFRM policy insert and every FIB route insert flushes the node's
+%% IPv4 route cache (xfrm_policy_insert and fib_table_insert both call
+%% rt_genid_bump_ipv4), and an inbound ESP packet that was routed just
+%% before such a flush is dropped in xfrm_input (XfrmInError) when its
+%% cached route is released under it. With one policy triple and one host
+%% route per UE an attach caused four flushes; measured on Helsinki, those
+%% drops were the SIP retransmissions and failed attaches that stopped the
+%% VoWiFi load tests between 25,000 and 58,000 UEs (KI-53).
+%%
+%% In static mode the inbound and forward directions use one wildcard
+%% policy per interface and address family (selector any -> any, tunnel
+%% template with unspecified addresses and reqid 0: for the inbound check
+%% the kernel treats unset template addresses as "any", so the pair covers
+%% every SA of the interface), installed the first time a UE of that
+%% family attaches. The outbound policy stays per UE, because an outbound
+%% tunnel template is resolved by its addresses. The per-UE host route is
+%% not installed either: the node's own traffic to a UE is routed like any
+%% other downlink, through the PGW-U's TUN and GTP-U back to the ePDG.
+%%
+%% The static policies carry no local address in their template, so the
+%% reconciler, which only considers policies whose template names this
+%% pod's outer address, never treats them as orphans.
+%%
+%% SPEC-DEVIATION: RFC 7296 clause 2.9, TS 33.402 clause 8.2 -- in static
+%% mode the kernel no longer enforces the negotiated traffic selector (TSi =
+%% the UE's PAA) on the inner source address: the wildcard inbound and
+%% forward policies accept any inner address out of any SA of the
+%% interface, so a UE could send packets with another UE's inner address
+%% into that UE's bearer. per-ue mode enforces it, at the price of the
+%% flushes above. Enforcement without flushes (an SA mark per UE, checked
+%% against the UE's address in nftables) is the follow-up recorded as KI-58.
+
+%% Static policies need the interface scope: in the node's global table a
+%% wildcard inbound policy would claim the IMS IPsec gateway's packets too.
+static_mode() ->
+    epdg_config:get(xfrm_policy_mode, "static") =:= "static"
+        andalso xfrm_if() =/= undefined.
+
+%% Make sure the interface's wildcard inbound and forward policies for the
+%% family of this UE's inner address exist. Idempotent per {if_id, family}
+%% within this incarnation; the kernel side is an update (create-or-replace).
+ensure_static(B, #{src := Src}, #state{static = Done} = State) ->
+    #{id := IfId, name := Name} = xfrm_if(),
+    Fam = case lists:member($:, Src) of true -> inet6; false -> inet end,
+    Key = {IfId, Fam},
+    case maps:is_key(Key, Done) of
+        true ->
+            {ok, State};
+        false ->
+            {Any, AnyAddr} = case Fam of
+                inet  -> {"0.0.0.0/0", {0, 0, 0, 0}};
+                inet6 -> {"::/0", {0, 0, 0, 0, 0, 0, 0, 0}}
+            end,
+            Base = #{src => Any, dst => Any, tmpl_src => AnyAddr,
+                     tmpl_dst => AnyAddr, reqid => 0},
+            case {do_create_policy(B, Base#{direction => in}),
+                  do_create_policy(B, Base#{direction => fwd})} of
+                {ok, ok} ->
+                    logger:notice("XFRM: static ~p inbound and forward policies "
+                                  "installed on ~s (if_id ~B)", [Fam, Name, IfId]),
+                    {ok, State#state{static = Done#{Key => true}}};
+                {In, Fwd} ->
+                    logger:error("XFRM: installing the static ~p policies on ~s "
+                                 "failed: in=~p fwd=~p", [Fam, Name, In, Fwd]),
+                    {{error, static_policies}, State}
+            end
+    end;
+ensure_static(_B, _Params, State) ->
+    {{error, invalid_params}, State}.
+
+%% The per-UE host route only exists in per-ue mode (see above).
+maybe_local_route(B, Op, Dir, Dst, If) ->
+    case static_mode() of
+        true  -> ok;
+        false -> local_route(B, Op, Dir, Dst, If)
+    end.
+
 %% Traffic the node itself sends to a UE (P-CSCF replies of a co-located
 %% IPsec gateway) has to be routed into the interface, or no policy of ours
 %% applies to it any more. One host route per attached UE in the instance's
 %% local-origin table, which `iif lo' consults; it travels with the
-%% outbound policy because that is the policy it feeds.
+%% outbound policy because that is the policy it feeds. per-ue mode only.
 local_route(netlink, Op, out, Dst, #{name := Name, local_table := Table}) ->
     case {Op, epdg_xfrm_nl:route(Op, Dst, Name, Table)} of
         {replace, R} -> R;

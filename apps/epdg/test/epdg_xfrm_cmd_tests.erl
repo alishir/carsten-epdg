@@ -36,12 +36,17 @@ xfrm_cmd_test_() ->
       fun without_interface_nothing_is_scoped/1,
       fun sa_and_policies_are_scoped_to_the_interface/1,
       fun outbound_policy_routes_node_traffic_into_the_interface/1,
-      fun other_mode_delete_addresses_the_other_scope/1]}.
+      fun other_mode_delete_addresses_the_other_scope/1,
+      fun static_mode_installs_the_interface_policies_once/1,
+      fun static_mode_without_interface_stays_per_ue/1]}.
 
 setup() ->
     %% These tests are about the `ip' command strings: pin the ip backend.
     application:set_env(epdg, xfrm_backend, "ip"),
     application:set_env(epdg, xfrm_backend_effective, ip),
+    %% The per-UE command set up to 0.0.101 is what most of these tests pin
+    %% down; the static-mode tests switch the mode themselves.
+    application:set_env(epdg, xfrm_policy_mode, "per-ue"),
     Base = case os:getenv("TMPDIR") of false -> "/tmp"; T -> T end,
     Dir  = filename:join(Base, "epdg_xfrm_cmd_"
                          ++ integer_to_list(erlang:unique_integer([positive]))),
@@ -66,6 +71,7 @@ cleanup({Dir, _Log, OldPath, Pid}) ->
     gen_server:stop(Pid),
     application:unset_env(epdg, xfrm_backend),
     application:unset_env(epdg, xfrm_backend_effective),
+    application:unset_env(epdg, xfrm_policy_mode),
     true = os:putenv("PATH", OldPath),
     _ = [file:delete(F) || F <- filelib:wildcard(filename:join(Dir, "*"))],
     _ = file:del_dir(Dir),
@@ -225,6 +231,60 @@ other_mode_delete_addresses_the_other_scope(Ctx) ->
     [WeAreScoped, WeAreUnscoped] = invocations(Ctx),
     [?_assertNot(lists:member("if_id", WeAreScoped)),
      ?_assert(has_seq(WeAreUnscoped, ["if_id", integer_to_list(16#45500000)]))].
+
+%% --- Static policy mode (0.0.102) -------------------------------------
+%%
+%% Every per-UE policy and route insert flushes the node's route cache and
+%% drops inbound ESP packets in flight (KI-53). In static mode the kernel
+%% gets ONE wildcard inbound and forward policy per interface and address
+%% family, once, and per UE only the outbound policy: no per-UE inbound or
+%% forward policy, no host route, and nothing to delete for them on detach;
+%% only a forced delete (the reconciler) still reaches the kernel.
+static_mode_installs_the_interface_policies_once(Ctx) ->
+    application:set_env(epdg, xfrm_policy_mode, "static"),
+    Second = fun(P) -> P#{reqid => ?REQID + 1} end,
+    with_xfrm_if(fun() ->
+        ok = epdg_xfrm:create_policy(ue_policy(in)),
+        ok = epdg_xfrm:create_policy(ue_policy(fwd)),
+        ok = epdg_xfrm:create_policy(ue_policy(out)),
+        ok = epdg_xfrm:create_policy(Second((ue_policy(in))#{src => "10.46.0.61/32"})),
+        ok = epdg_xfrm:create_policy(Second((ue_policy(fwd))#{src => "10.46.0.61/32"})),
+        ok = epdg_xfrm:create_policy(Second((ue_policy(out))#{dst => "10.46.0.61/32"})),
+        ok = epdg_xfrm:create_policy((ue_policy(in))#{src => "cafe:0:46:1::/64",
+                                                      dst => "::/0"}),
+        ok = epdg_xfrm:delete_policy(ue_policy(in)),
+        ok = epdg_xfrm:delete_policy(ue_policy(fwd)),
+        ok = epdg_xfrm:delete_policy(ue_policy(out)),
+        %% the reconciler removing a per-UE policy of a previous incarnation
+        ok = epdg_xfrm:delete_policy((ue_policy(fwd))#{force => true})
+    end),
+    IfId = integer_to_list(16#45500000),
+    [In4, Fwd4, OutA, OutB, In6, Fwd6, DelA, Forced] = All = invocations(Ctx),
+    [?_assert(has_seq(In4, ["policy", "update", "src", "0.0.0.0/0", "dst", "0.0.0.0/0",
+                            "dir", "in", "if_id", IfId])),
+     ?_assert(has_seq(In4, ["tmpl", "src", "0.0.0.0", "dst", "0.0.0.0", "proto", "esp",
+                            "reqid", "0", "mode", "tunnel"])),
+     ?_assert(has_seq(Fwd4, ["src", "0.0.0.0/0", "dst", "0.0.0.0/0", "dir", "fwd"])),
+     ?_assert(has_seq(OutA, ["dst", "10.46.0.60/32", "dir", "out"])),
+     ?_assert(has_seq(OutB, ["dst", "10.46.0.61/32", "dir", "out"])),
+     ?_assert(has_seq(In6, ["src", "::/0", "dst", "::/0", "dir", "in"])),
+     ?_assert(has_seq(In6, ["tmpl", "src", "::", "dst", "::"])),
+     ?_assert(has_seq(Fwd6, ["src", "::/0", "dst", "::/0", "dir", "fwd"])),
+     ?_assert(has_seq(DelA, ["policy", "delete"])),
+     ?_assert(has_seq(DelA, ["dir", "out"])),
+     ?_assert(has_seq(Forced, ["policy", "delete", "src", "10.46.0.60/32", "dst",
+                               "0.0.0.0/0", "dir", "fwd", "if_id", IfId])),
+     ?_assertNot(lists:any(fun(A) -> lists:member("route", A) end, All))].
+
+%% Without the interface scope a wildcard inbound policy would sit in the
+%% node's global table and claim the IMS IPsec gateway's packets: the mode
+%% must then fall back to the per-UE policies.
+static_mode_without_interface_stays_per_ue(Ctx) ->
+    application:set_env(epdg, xfrm_policy_mode, "static"),
+    ok = epdg_xfrm:create_policy(ue_policy(in)),
+    Argv = one_invocation(Ctx),
+    [?_assert(has_seq(Argv, ["src", "10.46.0.60/32", "dst", "0.0.0.0/0", "dir", "in"])),
+     ?_assertNot(lists:member("if_id", Argv))].
 
 %%====================================================================
 %% Helpers

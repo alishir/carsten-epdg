@@ -157,7 +157,11 @@ delete_item({pol, Src, Dst, Dir} = _Key) ->
                   "dir=~p (no live session claims its reqid)",
                   [Src, Dst, Dir]),
     epdg_metrics:inc(xfrm_reconcile_orphan_policies_deleted_total),
-    catch epdg_xfrm:delete_policy(#{src => Src, dst => Dst, direction => Dir}),
+    %% force: in static policy mode epdg_xfrm answers a UE's inbound and
+    %% forward deletes without a kernel call; an orphan of a previous
+    %% incarnation has to be removed regardless.
+    catch epdg_xfrm:delete_policy(#{src => Src, dst => Dst, direction => Dir,
+                                    force => true}),
     ok.
 
 %%====================================================================

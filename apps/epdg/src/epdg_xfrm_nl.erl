@@ -20,7 +20,7 @@
          create_sa/4, delete_sa/1, flush_sa_endpoint/1,
          create_policy/2, delete_policy/2,
          route/4, flush_all/0,
-         list_sas/1, list_policies/1]).
+         list_sas/1, list_policies/1, dev_accept_local/2]).
 
 -ifdef(TEST).
 -export([encode_sa_info/1, encode_policy_info/1, encode_tmpl/1,
@@ -82,8 +82,13 @@
 -define(XFRM_INF, 16#FFFFFFFFFFFFFFFF).
 
 %% rtnetlink
+-define(RTM_SETLINK,  19).
 -define(RTM_NEWROUTE, 24).
 -define(RTM_DELROUTE, 25).
+-define(IFLA_AF_SPEC, 26).
+-define(IFLA_INET_CONF, 1).
+-define(IPV4_DEVCONF_ACCEPT_LOCAL, 23).
+-define(NLA_F_NESTED, 16#8000).
 -define(RTA_DST,   1).
 -define(RTA_OIF,   4).
 -define(RTA_TABLE, 15).
@@ -628,6 +633,32 @@ dir(fwd) -> 2.
 dir_atom(0) -> in;
 dir_atom(1) -> out;
 dir_atom(_) -> fwd.
+
+%% net.ipv4.conf.<dev>.accept_local over rtnetlink (RTM_SETLINK with
+%% IFLA_AF_SPEC / AF_INET / IFLA_INET_CONF). /proc/sys is read-only in a
+%% hostNetwork pod; this path is not. A packet whose source is one of the
+%% node's own addresses is a martian on every interface but lo unless the
+%% interface accepts local sources, and that check runs in routing, before
+%% netfilter and XFRM, whatever rp_filter says. The IMS IPsec gateway's
+%% replies to a UE of a co-located ePDG come back into the ePDG's TUN
+%% through the PGW-U with the node's own VIP as source (static policy
+%% mode, which has no per-UE host route into the XFRM interface), so the
+%% TUN has to accept them (KI-53, run r9: half of the VoWiFi UEs never
+%% saw their 401).
+-spec dev_accept_local(string(), boolean()) -> ok | {error, term()}.
+dev_accept_local(DevName, On) ->
+    case ifindex(DevName) of
+        {ok, Ifindex} ->
+            Val = case On of true -> 1; false -> 0 end,
+            Conf = nla(?IFLA_INET_CONF bor ?NLA_F_NESTED,
+                       nla(?IPV4_DEVCONF_ACCEPT_LOCAL, <<Val:32/native>>)),
+            Inet = nla(?AF_INET bor ?NLA_F_NESTED, Conf),
+            Spec = nla(?IFLA_AF_SPEC bor ?NLA_F_NESTED, Inet),
+            %% struct ifinfomsg: family, pad, type, index, flags, change
+            Ifi = <<0:8, 0:8, 0:16/native, Ifindex:32/native, 0:32/native, 0:32/native>>,
+            request(?NETLINK_ROUTE, ?RTM_SETLINK, ?NLM_F_REQUEST bor ?NLM_F_ACK, Ifi, [Spec]);
+        E -> E
+    end.
 
 ifindex(Name) ->
     case file:read_file("/sys/class/net/" ++ Name ++ "/ifindex") of

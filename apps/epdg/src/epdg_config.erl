@@ -82,6 +82,19 @@ init() ->
     %% "netlink" (default): SAs, policies and routes over AF_NETLINK from
     %% Erlang; "ip": the `ip xfrm' / `ip route' commands used up to 0.0.100.
     set_from_env("EPDG_XFRM_BACKEND", xfrm_backend, "netlink"),
+    %% "static" (default from 0.0.102): one inbound and one forward policy
+    %% per XFRM interface and address family, installed on first use; a UE
+    %% adds only its two SAs and its outbound policy, and no host route in
+    %% the local-origin table (the node's own traffic to a UE takes the
+    %% PGW-U path like every other downlink). Every per-UE policy or route
+    %% insert flushes the node's route cache and drops inbound ESP packets
+    %% in flight (KI-53); this leaves one per attach instead of four.
+    %% "per-ue": the three per-UE policies and the host route of 0.0.92 to
+    %% 0.0.101 (together with EPDG_XFRM_BACKEND=ip the behaviour before
+    %% 0.0.101). Without an XFRM interface the ePDG stays per-UE: a wildcard
+    %% inbound policy in the node's global table would claim the IMS IPsec
+    %% gateway's packets too.
+    set_from_env("EPDG_XFRM_POLICY_MODE", xfrm_policy_mode, "static"),
     %% MTU of that interface: the largest inner packet that goes into one
     %% ESP packet. Must leave room for the tunnel overhead (up to ~90 bytes
     %% with NAT-T) below the smallest MTU on the way to the UE.

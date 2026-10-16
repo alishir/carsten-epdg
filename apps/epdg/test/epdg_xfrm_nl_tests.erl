@@ -65,6 +65,8 @@ kernel_test_() ->
               fun gcm_sa_is_an_aead_state/0,
               fun flush_endpoint_removes_both_sas/0,
               fun policy_fields_agree_with_ip/0,
+              fun wildcard_policies_stay_outside_the_reconcilers_view/0,
+              fun accept_local_is_set_over_netlink/0,
               fun route_lands_in_the_table/0]};
         false ->
             {"netlink kernel tests skipped: no NET_ADMIN or no ip", fun() -> ok end}
@@ -135,6 +137,43 @@ policy_fields_agree_with_ip() ->
     ok = epdg_xfrm_nl:delete_policy(P, If),
     ?assertEqual([], epdg_xfrm_nl:list_policies(?EPDG_OUTER)),
     ?assertMatch({error, _}, epdg_xfrm_nl:delete_policy(P, If)).
+
+%% Static policy mode: the kernel must take an inbound and a forward policy
+%% with an any-to-any selector and a tunnel template without addresses, and
+%% list_policies/1 (what the reconciler sees) must not return them, or the
+%% reconciler would delete them as orphans after the grace period.
+wildcard_policies_stay_outside_the_reconcilers_view() ->
+    If = #{id => 7, name => "epdgx7", local_table => 407},
+    Any = #{src => "0.0.0.0/0", dst => "0.0.0.0/0", tmpl_src => {0, 0, 0, 0},
+            tmpl_dst => {0, 0, 0, 0}, reqid => 0},
+    ok = epdg_xfrm_nl:create_policy(Any#{direction => in}, If),
+    ok = epdg_xfrm_nl:create_policy(Any#{direction => fwd}, If),
+    %% update, not add: a second incarnation re-installs them
+    ok = epdg_xfrm_nl:create_policy(Any#{direction => in}, If),
+    Out = ip("xfrm policy"),
+    [?assertEqual({Needle, found}, {Needle, case string:find(Out, Needle) of
+                                               nomatch -> {nomatch, Out}; _ -> found end}) ||
+        Needle <- ["src 0.0.0.0/0 dst 0.0.0.0/0", "dir in", "dir fwd", "if_id 0x7",
+                   "reqid 0 mode tunnel"]],
+    ?assertEqual([], epdg_xfrm_nl:list_policies(?EPDG_OUTER)),
+    ok = epdg_xfrm_nl:delete_policy(Any#{direction => in}, If),
+    ok = epdg_xfrm_nl:delete_policy(Any#{direction => fwd}, If),
+    ?assertEqual(nomatch, string:find(ip("xfrm policy"), "dir fwd")).
+
+%% The forwarder cannot write /proc/sys in a hostNetwork pod; the TUN's
+%% accept_local has to arrive over rtnetlink, and the kernel must read it
+%% back as set (KI-53, run r9: the gateway's replies to a co-located UE
+%% re-enter the node through the TUN with a local source address).
+accept_local_is_set_over_netlink() ->
+    Read = fun() ->
+        {ok, B} = file:read_file("/proc/sys/net/ipv4/conf/lo/accept_local"),
+        string:trim(binary_to_list(B))
+    end,
+    ok = epdg_xfrm_nl:dev_accept_local("lo", true),
+    ?assertEqual("1", Read()),
+    ok = epdg_xfrm_nl:dev_accept_local("lo", false),
+    ?assertEqual("0", Read()),
+    ?assertMatch({error, _}, epdg_xfrm_nl:dev_accept_local("nosuchdev9", true)).
 
 route_lands_in_the_table() ->
     ok = epdg_xfrm_nl:route(replace, "10.46.0.34/32", "lo", 407),

@@ -1001,6 +1001,22 @@ setup_shared_tun(Name, Table, Prio, Pools) ->
             RuleCmds = [rule_cmd(Fam, "add", Sel, Table, Prio)
                         || {Fam, Sel} <- Selectors],
             run_cmds_or_warn(Name, BaseCmds ++ RouteCmds ++ V6Cmds ++ RuleCmds),
+            %% The node's own replies to a UE (the co-located IMS IPsec
+            %% gateway's SIP) come back into this TUN through the PGW-U
+            %% with the node's VIP as source. Without accept_local the
+            %% kernel drops them as martians in routing, before netfilter
+            %% and XFRM, so nothing counts them (KI-53, run r9). sysctl
+            %% cannot set it here (/proc/sys is read-only in a hostNetwork
+            %% pod); rtnetlink can.
+            case epdg_xfrm_nl:dev_accept_local(Name, true) of
+                ok ->
+                    ok;
+                {error, Reason} ->
+                    logger:warning("TUN ~s: accept_local could not be set over "
+                                   "netlink (~p): replies of a co-located IMS "
+                                   "gateway to this ePDG's UEs will be dropped "
+                                   "as martians", [Name, Reason])
+            end,
             open_tun_port(Name)
     end.
 
